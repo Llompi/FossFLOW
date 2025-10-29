@@ -1,55 +1,95 @@
-# Use the official Node.js runtime as the base image
-FROM node:22 AS build
+# Multi-stage build for optimized production image
+FROM node:18-alpine AS builder
 
-# Set the working directory in the container
 WORKDIR /app
 
-# Copy package files for the monorepo
+# Copy package files
 COPY package*.json ./
-COPY packages/fossflow-lib/package*.json ./packages/fossflow-lib/
-COPY packages/fossflow-app/package*.json ./packages/fossflow-app/
+COPY yarn.lock* ./
 
-#Update NPM
-RUN npm install -g npm@11.5.2
+# Install dependencies
+RUN if [ -f yarn.lock ]; then yarn install --frozen-lockfile --production=false; else npm ci; fi
 
-# Install dependencies for the entire workspace
-RUN npm install
-
-# Copy the entire monorepo code
+# Copy source code
 COPY . .
 
-# Build the library first, then the app
-RUN npm run build:lib && npm run build:app
+# Build the application
+RUN if [ -f yarn.lock ]; then yarn build; else npm run build; fi
 
-# Use Node with nginx for production
-FROM node:22-alpine
+# Production stage
+FROM node:18-alpine AS runtime
 
-# Install nginx
-RUN apk add --no-cache nginx
+# Install security updates and required packages
+RUN apk update && apk upgrade && \
+    apk add --no-cache \
+    curl \
+    ca-certificates \
+    tzdata \
+    && rm -rf /var/cache/apk/*
 
-# Copy backend code
-COPY --from=build /app/packages/fossflow-backend /app/packages/fossflow-backend
+# Create non-root user
+RUN addgroup -g 1001 -S nodejs && \
+    adduser -S fossflow -u 1001 -G nodejs
 
-# Copy the built React app to Nginx's web server directory
-COPY --from=build /app/packages/fossflow-app/build /usr/share/nginx/html
+WORKDIR /app
 
-# Copy nginx configuration
-COPY nginx.conf /etc/nginx/http.d/default.conf
+# Copy package files
+COPY package*.json ./
+COPY yarn.lock* ./
 
-# Copy and set up entrypoint script
-COPY docker-entrypoint.sh /docker-entrypoint.sh
-RUN chmod +x /docker-entrypoint.sh
+# Install production dependencies only
+RUN if [ -f yarn.lock ]; then yarn install --frozen-lockfile --production; else npm ci --only=production; fi && \
+    npm cache clean --force
 
-# Create data directory for persistent storage
-RUN mkdir -p /data/diagrams
+# Copy built application from builder stage
+COPY --from=builder /app/dist ./dist
+COPY --from=builder /app/public ./public
 
-# Expose ports
-EXPOSE 80 3001
+# Copy additional required files
+COPY --chown=fossflow:nodejs server/ ./server/
+COPY --chown=fossflow:nodejs scripts/ ./scripts/
 
-# Environment variables with defaults
-ENV ENABLE_SERVER_STORAGE=true
-ENV STORAGE_PATH=/data/diagrams
-ENV BACKEND_PORT=3001
+# Create directories for runtime
+RUN mkdir -p /app/logs /app/uploads /app/certs && \
+    chown -R fossflow:nodejs /app
 
-# Start services
-ENTRYPOINT ["/docker-entrypoint.sh"]
+# Copy health check script
+COPY --chown=fossflow:nodejs <<EOF /app/healthcheck.js
+const http = require('http');
+
+const options = {
+  host: 'localhost',
+  port: 3000,
+  path: '/health',
+  timeout: 2000,
+};
+
+const request = http.request(options, (res) => {
+  console.log(`Health check status: ${res.statusCode}`);
+  if (res.statusCode === 200) {
+    process.exit(0);
+  } else {
+    process.exit(1);
+  }
+});
+
+request.on('error', (err) => {
+  console.log('Health check failed:', err.message);
+  process.exit(1);
+});
+
+request.end();
+EOF
+
+# Switch to non-root user
+USER fossflow
+
+# Expose port
+EXPOSE 3000
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+  CMD node /app/healthcheck.js
+
+# Start the application
+CMD ["node", "server/index.js"]

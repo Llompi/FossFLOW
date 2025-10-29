@@ -1,0 +1,155 @@
+version: '3.8'
+
+services:
+  fossflow:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        - NODE_ENV=production
+    ports:
+      - "${FOSSFLOW_PORT:-3000}:3000"
+    environment:
+      - NODE_ENV=production
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-fossflow}:${POSTGRES_PASSWORD:-fossflow_secure_pass}@postgres:5432/${POSTGRES_DB:-fossflow}
+      - JWT_SECRET=${JWT_SECRET:-change_this_jwt_secret_in_production}
+      - ENABLE_2FA=${ENABLE_2FA:-true}
+      - ENABLE_HTTPS=${ENABLE_HTTPS:-false}
+      - SSL_CERT_PATH=/app/certs/server.crt
+      - SSL_KEY_PATH=/app/certs/server.key
+      - MONITORING_ENABLED=${MONITORING_ENABLED:-true}
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./certs:/app/certs:ro
+      - ./uploads:/app/uploads
+      - ./logs:/app/logs
+    networks:
+      - fossflow-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB:-fossflow}
+      - POSTGRES_USER=${POSTGRES_USER:-fossflow}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-fossflow_secure_pass}
+      - POSTGRES_INITDB_ARGS=--auth-local=trust --auth-host=md5
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d
+      - ./postgres/backups:/backups
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    networks:
+      - fossflow-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-fossflow} -d ${POSTGRES_DB:-fossflow}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    command: >
+      postgres
+      -c shared_preload_libraries=pg_stat_statements
+      -c pg_stat_statements.track=all
+      -c max_connections=200
+      -c shared_buffers=256MB
+      -c effective_cache_size=1GB
+      -c maintenance_work_mem=64MB
+      -c checkpoint_completion_target=0.9
+      -c wal_buffers=16MB
+      -c default_statistics_target=100
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-redis_secure_pass}
+    volumes:
+      - redis_data:/data
+    networks:
+      - fossflow-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  nginx:
+    build:
+      context: ./nginx
+      dockerfile: Dockerfile
+    ports:
+      - "${HTTP_PORT:-80}:80"
+      - "${HTTPS_PORT:-443}:443"
+    volumes:
+      - ./nginx/conf:/etc/nginx/conf.d
+      - ./certs:/etc/nginx/certs:ro
+      - ./logs/nginx:/var/log/nginx
+    depends_on:
+      - fossflow
+    networks:
+      - fossflow-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "nginx", "-t"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    volumes:
+      - ./monitoring/prometheus:/etc/prometheus
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
+    networks:
+      - fossflow-network
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "${GRAFANA_PORT:-3001}:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin_secure_pass}
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_SERVER_DOMAIN=${DOMAIN:-localhost}
+      - GF_SMTP_ENABLED=${SMTP_ENABLED:-false}
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana:/etc/grafana/provisioning
+    networks:
+      - fossflow-network
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
+  prometheus_data:
+  grafana_data:
+
+networks:
+  fossflow-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
