@@ -15,3 +15,16 @@ coverage/
 .eslintcache
 *.tsbuildinfo
 /e2e-tests/target
+
+# Docker and deployment
+certs/*.crt
+certs/*.key
+certs/*.pem
+!certs/.gitkeep
+logs/
+uploads/
+postgres/backups/
+
+# Environment files
+.env.local
+.env.production
